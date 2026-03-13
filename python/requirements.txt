@@ -1,0 +1,8 @@
+# ESP-Drone Python controller dependencies
+# Install with:  pip install -r requirements.txt
+
+# OpenCV with ArUco support (contrib build required for aruco module)
+opencv-contrib-python>=4.8.0
+
+# Numerical computing (arrays, triangulation)
+numpy>=1.24.0
