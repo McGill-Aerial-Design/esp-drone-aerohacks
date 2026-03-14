@@ -172,14 +172,17 @@ class App:
     # ────────────────────────────────────────────────────────────────
 
     def _control_step(self) -> None:
-        if not self._is_connected():
-            return
-
         now = time.monotonic()
 
         if self._phase == _IDLE:
-            self._ctrl.stop()   # keepalive: prevent watchdog timeout
+            # Keepalive only makes sense when actually connected
+            if self._is_connected():
+                self._ctrl.stop()
             return
+
+        # During active flight keep sending commands even if telemetry goes
+        # quiet (motor RF noise can drop telemetry without breaking the UDP
+        # command link).  Stopping here would trigger the on-board watchdog.
 
         if self._phase == _TAKING_OFF:
             if now - self._phase_t0 < TAKEOFF_TIME:
@@ -229,12 +232,11 @@ class App:
             self._quit()
             return
 
-        if not self._is_connected():
-            if key in (ord("t"), ord("l"), ord("h"), ord("w"), ord("s"), ord("a"), ord("d"), ord("e"), ord("c")):
-                log.warning("Ignoring flight input while disconnected.")
-            return
-
         if key == ord("t") and self._phase == _IDLE:
+            # Require a live telemetry link before arming – proves drone is reachable
+            if not self._is_connected():
+                log.warning("Takeoff blocked: no telemetry from drone.")
+                return
             self._takeoff()
         elif key == ord("l") and self._phase in (_FLYING, _TAKING_OFF):
             self._land()
