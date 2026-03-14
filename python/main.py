@@ -72,6 +72,12 @@ LAND_Z_THRESHOLD =  0.08   # m – cut motors below this height
 MANUAL_VEL       = 0.05    # m/s per key-hold (WASD / E / C)
 CONTROL_HZ       = 20      # command rate (Hz)
 
+# Flight phase constants (state machine)
+_IDLE       = "idle"
+_TAKING_OFF = "taking_off"
+_FLYING     = "flying"
+_LANDING    = "landing"
+
 
 # ──────────────────────────────────────────────────────────────────── #
 #  Application                                                         #
@@ -86,13 +92,19 @@ class App:
         self._telemetry = Telemetry(self._driver)
         self._dashboard = Dashboard()
 
-        self._target  = np.array(list(HOVER_TARGET), dtype=float)
-        self._vel_cmd = (0.0, 0.0, 0.0)   # manual velocity command (m/s)
-        self._flying  = False
-        self._running = True
-        self._dt      = 1.0 / CONTROL_HZ
+        self._target   = np.array(list(HOVER_TARGET), dtype=float)
+        self._vel_cmd  = (0.0, 0.0, 0.0)   # manual velocity command (m/s)
+        self._phase    = _IDLE              # flight state machine
+        self._phase_t0 = 0.0               # time.monotonic() when phase started
+        self._running  = True
+        self._dt       = 1.0 / CONTROL_HZ
 
         signal.signal(signal.SIGINT, lambda *_: self._quit())
+
+    @property
+    def _flying(self) -> bool:
+        """True while in any active flight phase (used by dashboard)."""
+        return self._phase != _IDLE
 
     def _is_connected(self) -> bool:
         """True when telemetry is actively receiving packets from the drone."""
@@ -163,10 +175,34 @@ class App:
         if not self._is_connected():
             return
 
-        if not self._flying:
-            self._ctrl.stop()  # keepalive: prevent watchdog timeout without arming
+        now = time.monotonic()
+
+        if self._phase == _IDLE:
+            self._ctrl.stop()   # keepalive: prevent watchdog timeout
             return
 
+        if self._phase == _TAKING_OFF:
+            if now - self._phase_t0 < TAKEOFF_TIME:
+                self._ctrl.send_velocity_world(0.0, 0.0, TAKEOFF_VZ)
+            else:
+                self._phase = _FLYING
+                log.info("Airborne – E/C = altitude  WASD = lateral  H = hold  L = land")
+            return
+
+        if self._phase == _LANDING:
+            elapsed  = now - self._phase_t0
+            deadline = self._phase_t0 + abs(1.5 / LAND_VZ)
+            if elapsed > 1.5 and self._telemetry.active:
+                if self._telemetry.get_data().get("stateEstimate.z", 1.0) < LAND_Z_THRESHOLD:
+                    self._on_landed()
+                    return
+            if now >= deadline:
+                self._on_landed()
+                return
+            self._ctrl.send_velocity_world(0.0, 0.0, LAND_VZ)
+            return
+
+        # _FLYING
         # ── TODO (participants): replace with vision-based position control ──
         # pos = self._tracker.get_position()
         # if pos is not None:
@@ -177,12 +213,19 @@ class App:
 
         self._ctrl.send_velocity_world(*self._vel_cmd)
 
+    def _on_landed(self) -> None:
+        self._ctrl.stop()
+        self._phase   = _IDLE
+        self._vel_cmd = (0.0, 0.0, 0.0)
+        self._pid.reset()
+        log.info("Landed.")
+
     # ────────────────────────────────────────────────────────────────
     # Keyboard
     # ────────────────────────────────────────────────────────────────
 
     def _handle_key(self, key: int) -> None:
-        if key in (ord("q"), 27):
+        if key in (ord("q"), 27):           # Q / ESC – always works immediately
             self._quit()
             return
 
@@ -191,11 +234,11 @@ class App:
                 log.warning("Ignoring flight input while disconnected.")
             return
 
-        elif key == ord("t") and not self._flying:
+        if key == ord("t") and self._phase == _IDLE:
             self._takeoff()
-        elif key == ord("l") and self._flying:
+        elif key == ord("l") and self._phase in (_FLYING, _TAKING_OFF):
             self._land()
-        elif self._flying:
+        elif self._phase == _FLYING:
             vx = vy = vz = 0.0
             if   key == ord("h"):  log.info("Hold")
             elif key == ord("w"):  vy = +MANUAL_VEL
@@ -214,37 +257,16 @@ class App:
     # ────────────────────────────────────────────────────────────────
 
     def _takeoff(self) -> None:
-        if not self._is_connected():
-            log.warning("Takeoff blocked: drone not connected.")
-            return
         log.info("Takeoff – brief liftoff burst …")
-        self._flying  = True
-        self._vel_cmd = (0.0, 0.0, 0.0)
-        t0 = time.monotonic()
-        while time.monotonic() - t0 < TAKEOFF_TIME:
-            self._ctrl.send_velocity_world(0.0, 0.0, TAKEOFF_VZ)
-            time.sleep(self._dt)
-        log.info("Airborne – E/C = altitude  WASD = lateral  H = hold  L = land")
+        self._phase    = _TAKING_OFF
+        self._phase_t0 = time.monotonic()
+        self._vel_cmd  = (0.0, 0.0, 0.0)
 
     def _land(self) -> None:
-        if not self._is_connected():
-            log.warning("Land blocked: drone not connected.")
-            return
         log.info("Landing …")
-        self._vel_cmd = (0.0, 0.0, 0.0)
-        t0       = time.monotonic()
-        deadline = t0 + abs(1.5 / LAND_VZ)   # ~10 s: covers up to 1.5 m altitude
-        while time.monotonic() < deadline:
-            # After a brief descent, trust stateEstimate.z to detect ground contact
-            if time.monotonic() - t0 > 1.5 and self._telemetry.active:
-                if self._telemetry.get_data().get("stateEstimate.z", 1.0) < LAND_Z_THRESHOLD:
-                    break
-            self._ctrl.send_velocity_world(0.0, 0.0, LAND_VZ)
-            time.sleep(self._dt)
-        self._ctrl.stop()
-        self._flying = False
-        self._pid.reset()
-        log.info("Landed.")
+        self._vel_cmd  = (0.0, 0.0, 0.0)
+        self._phase    = _LANDING
+        self._phase_t0 = time.monotonic()
 
     def _quit(self) -> None:
         log.info("Quit")
