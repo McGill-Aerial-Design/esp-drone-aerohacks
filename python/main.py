@@ -92,12 +92,13 @@ class App:
         self._telemetry = Telemetry(self._driver)
         self._dashboard = Dashboard()
 
-        self._target   = np.array(list(HOVER_TARGET), dtype=float)
-        self._vel_cmd  = (0.0, 0.0, 0.0)   # manual velocity command (m/s)
-        self._phase    = _IDLE              # flight state machine
-        self._phase_t0 = 0.0               # time.monotonic() when phase started
-        self._running  = True
-        self._dt       = 1.0 / CONTROL_HZ
+        self._target      = np.array(list(HOVER_TARGET), dtype=float)
+        self._vel_cmd     = (0.0, 0.0, 0.0)   # manual velocity command (m/s)
+        self._vel_key_t   = 0.0               # time of last WASD/EC keypress
+        self._phase       = _IDLE              # flight state machine
+        self._phase_t0    = 0.0               # time.monotonic() when phase started
+        self._running     = True
+        self._dt          = 1.0 / CONTROL_HZ
 
         signal.signal(signal.SIGINT, lambda *_: self._quit())
 
@@ -134,21 +135,27 @@ class App:
 
         log.info("Ready.  T=takeoff  L=land  H=hold  WASD/EC=move  Q=quit")
 
-        last_cmd = time.monotonic()
+        last_cmd  = time.monotonic()
+        last_draw = time.monotonic()
+        _draw_dt  = 1.0 / 20   # render at 20 fps – keeps CPU free for key polling
         try:
             while self._running:
-                # -- render both windows + read keyboard --------------
-                self._tracker.show()
-                self._update_dashboard()
+                now = time.monotonic()
+
+                # -- key is always polled, never blocked by rendering --
                 key = cv2.waitKey(1) & 0xFF
                 self._handle_key(key)
 
+                # -- rendering at 20 fps ------------------------------
+                if now - last_draw >= _draw_dt:
+                    last_draw = now
+                    self._tracker.show()
+                    self._update_dashboard()
+
                 # -- fixed-rate control loop --------------------------
-                now = time.monotonic()
-                if now - last_cmd < self._dt:
-                    continue
-                last_cmd = now
-                self._control_step()
+                if now - last_cmd >= self._dt:
+                    last_cmd = now
+                    self._control_step()
 
         finally:
             self._shutdown()
@@ -206,6 +213,14 @@ class App:
             return
 
         # _FLYING
+
+        # Auto-stop when a WASD/EC key is released: OS key-repeat fires every
+        # ~30 ms while held; if we haven't seen one for 200 ms, the key is up.
+        if self._vel_cmd != (0.0, 0.0, 0.0) and self._vel_key_t > 0.0:
+            if now - self._vel_key_t > 0.20:
+                self._vel_cmd = (0.0, 0.0, 0.0)
+                log.info("Key released – hovering")
+
         # ── TODO (participants): replace with vision-based position control ──
         # pos = self._tracker.get_position()
         # if pos is not None:
@@ -229,6 +244,7 @@ class App:
 
     def _handle_key(self, key: int) -> None:
         if key in (ord("q"), 27):           # Q / ESC – always works immediately
+            self._emergency_stop_now()
             self._quit()
             return
 
@@ -241,18 +257,25 @@ class App:
         elif key == ord("l") and self._phase in (_FLYING, _TAKING_OFF):
             self._land()
         elif self._phase == _FLYING:
-            vx = vy = vz = 0.0
-            if   key == ord("h"):  log.info("Hold")
-            elif key == ord("w"):  vy = +MANUAL_VEL
-            elif key == ord("s"):  vy = -MANUAL_VEL
-            elif key == ord("d"):  vx = +MANUAL_VEL
-            elif key == ord("a"):  vx = -MANUAL_VEL
-            elif key == ord("e"):  vz = +MANUAL_VEL
-            elif key == ord("c"):  vz = -MANUAL_VEL
-            new_cmd = (vx, vy, vz)
-            if new_cmd != self._vel_cmd:
-                log.info("vel → (%.2f, %.2f, %.2f) m/s", *new_cmd)
-            self._vel_cmd = new_cmd
+            _VEL_MAP = {
+                ord("w"): (0.0, +MANUAL_VEL, 0.0),
+                ord("s"): (0.0, -MANUAL_VEL, 0.0),
+                ord("d"): (+MANUAL_VEL, 0.0, 0.0),
+                ord("a"): (-MANUAL_VEL, 0.0, 0.0),
+                ord("e"): (0.0, 0.0, +MANUAL_VEL),
+                ord("c"): (0.0, 0.0, -MANUAL_VEL),
+            }
+            if key == ord("h"):
+                self._vel_cmd   = (0.0, 0.0, 0.0)
+                self._vel_key_t = 0.0   # disable auto-release
+                log.info("Hold")
+            elif key in _VEL_MAP:
+                new_cmd = _VEL_MAP[key]
+                if new_cmd != self._vel_cmd:
+                    log.info("vel → (%.2f, %.2f, %.2f) m/s", *new_cmd)
+                self._vel_cmd   = new_cmd
+                self._vel_key_t = time.monotonic()
+            # key == 0xFF (no key): do NOT touch _vel_cmd
 
     # ────────────────────────────────────────────────────────────────
     # Flight phases
@@ -270,13 +293,24 @@ class App:
         self._phase    = _LANDING
         self._phase_t0 = time.monotonic()
 
+    def _emergency_stop_now(self) -> None:
+        """Send stop commands immediately and repeatedly to cut motors fast.
+
+        The firmware watchdog takes up to 2 s to cut motors if these packets
+        are lost; sending several bursts ensures at least one gets through
+        despite RF noise from spinning motors.
+        """
+        for _ in range(5):
+            self._ctrl.stop()            # TYPE_STOP  – nulls the setpoint queue
+            self._ctrl.emergency_stop()  # LOC_EMERGENCY_STOP – sets firmware flag
+        log.warning("Emergency stop burst sent.")
+
     def _quit(self) -> None:
         log.info("Quit")
         self._running = False
 
     def _shutdown(self) -> None:
-        self._ctrl.emergency_stop()
-        log.warning("Emergency stop sent.")
+        self._emergency_stop_now()       # one more burst during cleanup
         self._telemetry.stop()
         self._tracker.stop()
         self._driver.disconnect()
